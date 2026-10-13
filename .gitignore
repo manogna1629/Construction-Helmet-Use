@@ -1,0 +1,32 @@
+# Data (downloaded / generated at runtime)
+data/cropped/
+data/review/
+*.zip
+
+# Model checkpoints and exported review crops
+results/*.keras
+results/*.h5
+results/error_review/
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+.env
+
+# LaTeX build files
+report/*.aux
+report/*.bbl
+report/*.blg
+report/*.log
+report/*.out
+report/*.pdf
+report/*.synctex.gz
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
