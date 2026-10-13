@@ -1,0 +1,382 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{url}
+
+\lstset{
+  language=Python,
+  basicstyle=\ttfamily\scriptsize,
+  keywordstyle=\color{blue!60!black},
+  commentstyle=\color{gray},
+  stringstyle=\color{teal!70!black},
+  frame=single,
+  breaklines=true,
+  columns=fullflexible,
+  showstringspaces=false
+}
+
+\begin{document}
+
+\title{Construction Helmet Use Recognition:\\ A Benchmarked and Explainable CNN Classification Study}
+
+\author{\IEEEauthorblockN{Iyallareddy Likith Reddy}
+\IEEEauthorblockA{MSc Data Science, Arden University\\
+Berlin, Germany}}
+
+\maketitle
+
+\begin{abstract}
+Hard hats are the first line of defence against head injuries on construction sites, yet checking that every worker is wearing one still depends largely on manual supervision. This study frames helmet compliance as a binary image recognition problem: given a cropped image of a worker's head, decide whether a helmet is present. The Kaggle Hard Hat Workers detection dataset was converted into 17{,}044 cleaned head crops (13{,}410 helmet, 3{,}634 no-helmet). A custom CNN trained from scratch (258{,}881 parameters) was compared with ImageNet-pretrained MobileNetV2 and ResNet50 models with new classification heads. On the held-out test set MobileNetV2 reached 97.34\% accuracy, an F1-score of 0.933 and a recall of 0.926 on the safety-critical no-helmet class. The custom CNN reached 94.44\% accuracy and 0.839 recall with about one-ninth of the parameters and 22\% lower latency. The ResNet50 run was interrupted during training and could not be evaluated. Grad-CAM was used to inspect the custom CNN's decisions. The paper closes with the limitations of the experimental setup that should be addressed before the numbers are treated as final.
+\end{abstract}
+
+\begin{IEEEkeywords}
+construction safety, helmet use recognition, convolutional neural network, transfer learning, MobileNetV2, ResNet50, Grad-CAM
+\end{IEEEkeywords}
+
+%==========================================================================
+\section{Introduction}
+%==========================================================================
+Construction is one of the most hazardous industries to work in. Falling objects and falls from height are common causes of serious injury, and the head is especially vulnerable. Regulations require hard hats across active work areas, but in practice compliance is checked by supervisors walking the site. This is slow, depends on who is watching, and easily misses short lapses.
+
+Most large sites already run CCTV, so automatic visual checking is an obvious next step. Earlier studies treated the problem as object detection, locating every helmet and bare head in a full frame \cite{fang2018detecting,wu2019automatic,nath2020deep}. This project takes a narrower view. Assuming that heads have already been located (by an upstream detector, or from annotations as here), the remaining question is a simple one: \emph{is this head wearing a helmet?} Treating this as image classification makes it easy to benchmark different CNN architectures fairly and to look inside their decisions.
+
+The aims of the project were to:
+\begin{itemize}
+  \item build a clean helmet/no-helmet classification dataset from a public detection dataset;
+  \item compare a CNN trained from scratch against two transfer-learning models;
+  \item evaluate the models with metrics that reflect the safety cost of each error type, plus inference latency;
+  \item use Grad-CAM to check what image regions drive the predictions.
+\end{itemize}
+
+%==========================================================================
+\section{Related Work}
+%==========================================================================
+Fang \emph{et al.} \cite{fang2018detecting} used Faster R-CNN on far-field surveillance video and showed that non-hardhat-use can be detected even when workers are small in the frame. Wu \emph{et al.} \cite{wu2019automatic} published a hardhat benchmark that also labels helmet colour, and improved an SSD detector for the task. Nath \emph{et al.} \cite{nath2020deep} compared three YOLO-based approaches to PPE detection, one of which detects workers first and then classifies their PPE with a separate CNN. That two-stage design is the closest to the setting studied here.
+
+Transfer learning \cite{pan2010survey} re-uses features learned on a large source dataset such as ImageNet \cite{deng2009imagenet}. ResNet50 \cite{he2016deep} and MobileNetV2 \cite{sandler2018mobilenetv2} represent the accurate-but-heavy and the efficient ends of the range of common backbones. Batch normalisation \cite{ioffe2015batch} and dropout \cite{srivastava2014dropout} are standard in small CNNs trained from scratch. Grad-CAM \cite{selvaraju2017gradcam} produces class-specific heat maps from the gradients of the last convolutional layer and is widely used to sanity-check image classifiers.
+
+%==========================================================================
+\section{Dataset and Preparation}
+%==========================================================================
+\subsection{Source dataset}
+The Hard Hat Workers dataset \cite{kaggle_hardhat} has 5{,}000 site images, each with a Pascal-VOC XML file. Scanning all annotations gave 18{,}966 \texttt{helmet} boxes, 5{,}785 \texttt{head} boxes (head without a helmet) and 751 \texttt{person} boxes.
+
+\subsection{From detection boxes to classification crops}
+Each \texttt{helmet} box was mapped to the class \emph{helmet} and each \texttt{head} box to \emph{no\_helmet}. \texttt{person} boxes were dropped because a whole-body box says nothing direct about the head. Every remaining box was cropped with 10\% padding on each side, and boxes smaller than 20\,px in either dimension were skipped.
+
+\begin{lstlisting}
+CLASS_MAP = {"helmet": "helmet", "head": "no_helmet", "person": None}
+crop_summary = voc_crop.crop_dataset(
+    ANNOTATIONS_DIR, IMAGES_DIR, CROPPED_DIR, CLASS_MAP,
+    min_box_size=20, padding_frac=0.10)
+\end{lstlisting}
+
+The mapped boxes total $18{,}966 + 5{,}785 = 24{,}751$. Of these, 7{,}673 were too small, leaving
+\[
+24{,}751 - 7{,}673 = 17{,}078 \text{ crops},
+\]
+made up of 13{,}443 helmet and 3{,}635 no\_helmet crops.
+So about $7{,}673 / 24{,}751 = 31.0\%$ of usable boxes were lost to the size filter. This is a large share and reflects how many workers appear far from the camera.
+
+\subsection{Cleaning}
+A conservative cleaning pass flagged near-duplicates with perceptual hashing \cite{zauner2010implementation} and blurry crops with the variance of the Laplacian \cite{pech2000diatom}, using a blur threshold of 15. A dry run was checked first. Flagged files were moved to a review folder rather than deleted. The pass removed 34 crops (27 duplicates, 7 blurry), giving the final dataset:
+\[
+13{,}410 \text{ helmet} + 3{,}634 \text{ no\_helmet} = 17{,}044 \text{ crops}.
+\]
+
+\subsection{Class imbalance}
+The imbalance ratio is
+\[
+\frac{13{,}410}{3{,}634} = 3.69,
+\]
+and the no-helmet share is $3{,}634 / 17{,}044 = 21.32\%$. A trivial model that always answers \emph{helmet} would therefore score $1 - 0.2132 = 78.68\%$ accuracy while catching no violations at all. This is the reason accuracy alone is not a useful headline metric here (Fig.~\ref{fig:balance}).
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.62\linewidth]{figures/class_balance.png}
+\caption{Class balance of the cleaned crop dataset.}
+\label{fig:balance}
+\end{figure}
+
+\subsection{Splitting}
+Crops were resized to $160\times160$ and loaded with Keras \texttt{image\_dataset\_from\_directory} using seed 42. Labels follow alphabetical folder order, so \emph{helmet} $=0$ and \emph{no\_helmet} $=1$; the no-helmet class is therefore the positive class in all metrics below. A 30\% holdout was taken first:
+\begin{align*}
+\lfloor 0.30 \times 17{,}044 \rfloor &= 5{,}113 \text{ holdout},\\
+17{,}044 - 5{,}113 &= 11{,}931 \text{ train}.
+\end{align*}
+With batch size 32 the holdout has $\lceil 5{,}113 / 32 \rceil = 160$ batches. The first $160/2 = 80$ batches ($80 \times 32 = 2{,}560$ crops) form the validation set and the rest form the test set:
+\[
+5{,}113 - 2{,}560 = 2{,}553 \text{ test crops}.
+\]
+
+\subsection{Augmentation}
+Training batches were augmented with horizontal flips, small rotations (factor 0.05, about $\pm18^\circ$), and brightness and contrast jitter of $\pm15\%$. Vertical flips were deliberately left out because an upside-down worker is not a realistic view. Fig.~\ref{fig:aug} shows a sample.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.75\linewidth]{figures/augmentation_samples.png}
+\caption{Augmented training crops.}
+\label{fig:aug}
+\end{figure}
+
+%==========================================================================
+\section{Methodology}
+%==========================================================================
+\subsection{Custom CNN}
+The baseline network is a four-stage CNN trained from scratch on inputs scaled to $[0,1]$. Each stage is a $3\times3$ convolution with ReLU, batch normalisation and $2\times2$ max-pooling. Global average pooling feeds a 128-unit dense layer, with dropout of 0.4 before and after it, and a single sigmoid output.
+
+\begin{lstlisting}
+x = layers.Conv2D(32, 3, padding="same", activation="relu")(inputs)
+x = layers.BatchNormalization()(x)
+x = layers.MaxPooling2D()(x)
+# ... repeated with 64, 128, 128 filters ...
+x = layers.GlobalAveragePooling2D()(x)
+x = layers.Dropout(dropout)(x)
+x = layers.Dense(128, activation="relu")(x)
+x = layers.Dropout(dropout)(x)
+outputs = layers.Dense(1, activation="sigmoid")(x)
+\end{lstlisting}
+
+\textbf{Feature map sizes.} With \texttt{padding="same"} and stride 1, each convolution keeps the spatial size. Each $2\times2$ pool with stride 2 halves it:
+\[
+160 \rightarrow 80 \rightarrow 40 \rightarrow 20 \rightarrow 10 .
+\]
+The final map is $10\times10\times128$, and global average pooling reduces it to a 128-dimensional vector.
+
+\textbf{Parameter count.} A convolution with bias has $k^2 C_{\text{in}} C_{\text{out}} + C_{\text{out}}$ parameters. A batch-norm layer has $4C$: $\gamma$ and $\beta$ are trained, while the moving mean and variance are not. Working through each layer:
+\begin{align*}
+\text{Conv}_1 &= 9 \cdot 3 \cdot 32 + 32 = 864 + 32 = 896\\
+\text{Conv}_2 &= 9 \cdot 32 \cdot 64 + 64 = 18{,}432 + 64 = 18{,}496\\
+\text{Conv}_3 &= 9 \cdot 64 \cdot 128 + 128 = 73{,}728 + 128 = 73{,}856\\
+\text{Conv}_4 &= 9 \cdot 128 \cdot 128 + 128 = 147{,}456 + 128 = 147{,}584\\
+\text{BN (all)} &= 4\,(32 + 64 + 128 + 128) = 4 \cdot 352 = 1{,}408\\
+\text{Dense}_{128} &= 128 \cdot 128 + 128 = 16{,}512\\
+\text{Dense}_{1} &= 128 \cdot 1 + 1 = 129
+\end{align*}
+Summing:
+\begin{align*}
+&896 + 18{,}496 + 73{,}856 + 147{,}584\\
+&\quad + 1{,}408 + 16{,}512 + 129 = 258{,}881,
+\end{align*}
+which matches the Keras summary. The non-trainable part is the batch-norm statistics, $2 \cdot 352 = 704$, leaving $258{,}177$ trainable parameters.
+
+\subsection{Transfer-learning models}
+MobileNetV2 \cite{sandler2018mobilenetv2} and ResNet50 \cite{he2016deep} were loaded with ImageNet weights and without their top layers. Each backbone's own \texttt{preprocess\_input} function sits inside the model as a \texttt{Lambda} layer, so the models take raw $[0,255]$ pixels. The head is global average pooling, dropout of 0.3 and a sigmoid unit.
+
+\begin{lstlisting}
+base_model = backbone_cls(input_shape=input_shape,
+                          include_top=False, weights="imagenet")
+base_model.trainable = False
+x = layers.Lambda(preprocess_fn, name="preprocess")(inputs)
+x = base_model(x, training=False)
+x = layers.GlobalAveragePooling2D()(x)
+x = layers.Dropout(0.3)(x)
+outputs = layers.Dense(1, activation="sigmoid")(x)
+\end{lstlisting}
+
+The new head adds $1{,}280 + 1 = 1{,}281$ parameters to MobileNetV2, giving 2{,}259{,}265 in total. It adds $2{,}048 + 1 = 2{,}049$ to ResNet50, giving 23{,}589{,}761 in total.
+
+The backbones stayed frozen throughout training, so only the new head was learned. Fine-tuning the upper backbone layers is left for future work.
+
+\subsection{Loss and optimisation}
+All models minimise binary cross-entropy. For one sample with label $y \in \{0,1\}$ and predicted probability $p = \sigma(z)$ of \emph{no\_helmet},
+\begin{equation}
+\mathcal{L}(y, p) = -\left[\, y \log p + (1 - y)\log(1 - p) \,\right].
+\end{equation}
+For example, a bare head ($y=1$) predicted at $p=0.9$ costs $-\log 0.9 = 0.105$. Predicted at $p=0.1$, it costs $-\log 0.1 = 2.303$, about 22 times more.
+
+Optimisation used Adam \cite{kingma2015adam} at learning rate $10^{-3}$ for all three models, with a batch size of 32 and a two-epoch budget. Early stopping on validation loss (patience 5, best weights restored) and checkpointing were enabled. The model is implemented in TensorFlow \cite{abadi2016tensorflow}.
+
+\subsection{Evaluation metrics}
+Treating \emph{no\_helmet} as positive, with the counts TP, FP, FN and TN taken from the confusion matrix:
+\begin{align}
+\text{Accuracy} &= \frac{TP + TN}{TP + TN + FP + FN},\\
+\text{Precision} &= \frac{TP}{TP + FP}, \qquad \text{Recall} = \frac{TP}{TP + FN},\\
+F_1 &= \frac{2 \cdot \text{Precision} \cdot \text{Recall}}{\text{Precision} + \text{Recall}}.
+\end{align}
+On a site, a false negative (a bare head marked as safe) is the expensive error, so recall on no-helmet carries the most weight. ROC-AUC summarises how well the model ranks bare heads above helmets across all thresholds. Mean single-image inference time was also measured over 50 test crops after 5 warm-up calls.
+
+%==========================================================================
+\section{Results}
+%==========================================================================
+\subsection{Training behaviour}
+Each model was trained for two epochs on the Colab CPU runtime (no GPU was attached). Table~\ref{tab:training} lists the epoch-level figures.
+
+\begin{table}[t]
+\centering
+\caption{Training and validation figures per epoch}
+\label{tab:training}
+\setlength{\tabcolsep}{2.5pt}
+\footnotesize
+\begin{tabular}{llcccc}
+\toprule
+Model & Ep. & Train loss & Train acc. & Val loss & Val acc. \\
+\midrule
+Custom CNN & 1 & 0.3120 & 0.8655 & 0.3884 & 0.7988 \\
+ & 2 & 0.2106 & 0.9195 & 0.1526 & 0.9453 \\
+\midrule
+MobileNetV2 & 1 & 0.2170 & 0.9129 & 0.1044 & 0.9668 \\
+ & 2 & 0.1323 & 0.9492 & 0.0910 & 0.9684 \\
+\midrule
+ResNet50 & 1 & 0.1515 & 0.9411 & 0.0771 & 0.9750 \\
+ & 2 & 0.0894 & 0.9653 & -- & -- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The custom CNN improved sharply between the two epochs. Validation accuracy rose from 79.88\% to 94.53\%, and validation loss fell from 0.3884 to 0.1526, a drop of
+\[
+\frac{0.3884 - 0.1526}{0.3884} = \frac{0.2358}{0.3884} = 60.7\%.
+\]
+Fig.~\ref{fig:cnncurve} shows both curves still moving steeply at the end, so the model had not converged.
+
+MobileNetV2 started far higher: 96.68\% validation accuracy after one epoch with only its head trained. The second epoch added only 0.16 points (96.84\%), suggesting the frozen features had already done most of the work. For MobileNetV2 the validation loss stays below the training loss, which is expected, since dropout and augmentation are active only during training.
+
+ResNet50 reached the best validation accuracy of all after one epoch (97.50\%). Its second epoch finished the training pass (train accuracy 0.9653) but the run was interrupted by hand before validation completed, because of session time. As a result, ResNet50 never entered the evaluation loop and has no test results.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/custom_cnn_history.png}
+\caption{Custom CNN loss and accuracy over the two training epochs.}
+\label{fig:cnncurve}
+\end{figure}
+
+\subsection{Test-set performance}
+Table~\ref{tab:results} summarises test performance, and Fig.~\ref{fig:cm} shows the confusion matrices.
+
+\begin{table}[t]
+\centering
+\caption{Test-set results (positive class = no\_helmet, threshold 0.5)}
+\label{tab:results}
+\begin{tabular}{lcc}
+\toprule
+Metric & Custom CNN & MobileNetV2 \\
+\midrule
+Accuracy & 0.9444 & \textbf{0.9734} \\
+Precision & 0.8833 & \textbf{0.9407} \\
+Recall & 0.8394 & \textbf{0.9261} \\
+F1-score & 0.8608 & \textbf{0.9333} \\
+ROC-AUC & 0.9773 & \textbf{0.9925} \\
+Parameters & \textbf{258{,}881} & 2{,}259{,}265 \\
+Latency (ms) & \textbf{116.5} & 149.6 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/confusion_matrices.png}
+\caption{Test-set confusion matrices (rows: actual, columns: predicted).}
+\label{fig:cm}
+\end{figure}
+
+\textbf{Working from the confusion matrices.} For the custom CNN, $TP = 439$, $FN = 84$, $FP = 58$ and $TN = 1{,}972$:
+\begin{align*}
+\text{Precision} &= \frac{439}{439 + 58} = \frac{439}{497} = 0.8833\\
+\text{Recall} &= \frac{439}{439 + 84} = \frac{439}{523} = 0.8394\\
+F_1 &= \frac{2 \times 0.8833 \times 0.8394}{0.8833 + 0.8394} = \frac{1.4829}{1.7227} = 0.8608\\
+\text{Accuracy} &= \frac{1{,}972 + 439}{2{,}553} = \frac{2{,}411}{2{,}553} = 0.9444
+\end{align*}
+
+For MobileNetV2, $TP = 476$, $FN = 38$, $FP = 30$ and $TN = 2{,}009$:
+\begin{align*}
+\text{Precision} &= \frac{476}{476 + 30} = \frac{476}{506} = 0.9407\\
+\text{Recall} &= \frac{476}{476 + 38} = \frac{476}{514} = 0.9261\\
+F_1 &= \frac{2 \times 0.9407 \times 0.9261}{0.9407 + 0.9261} = \frac{1.7424}{1.8668} = 0.9333\\
+\text{Accuracy} &= \frac{2{,}009 + 476}{2{,}553} = \frac{2{,}485}{2{,}553} = 0.9734
+\end{align*}
+
+To put the custom CNN's accuracy in context, an always-helmet model scores $2{,}030 / 2{,}553 = 79.51\%$ on its test sample. The custom CNN improves on that by
+\[
+94.44 - 79.51 = 14.93 \text{ percentage points},
+\]
+and recovers 84\% of bare heads, so it has learned a genuinely useful decision rule even after two epochs.
+
+MobileNetV2 is better on every quality metric. It misses 38 bare heads against the custom CNN's 84, a reduction of $(84-38)/84 = 54.8\%$. It also raises 30 false alarms against 58, a reduction of $(58-30)/58 = 48.3\%$. The two models' ROC-AUC values (0.977 and 0.993) are both high, and their ROC curves (Fig.~\ref{fig:roc}) both bend sharply towards the top-left corner.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.78\linewidth]{figures/roc_curves.png}
+\caption{ROC curves on the test set.}
+\label{fig:roc}
+\end{figure}
+
+\subsection{Model size and latency}
+The custom CNN has
+\[
+\frac{258{,}881}{2{,}259{,}265} = 0.115
+\]
+of MobileNetV2's parameters, roughly one-ninth. Its mean single-image latency is 116.5\,ms against 149.6\,ms (Fig.~\ref{fig:latency}), which is
+\[
+\frac{149.6 - 116.5}{149.6} = \frac{33.1}{149.6} = 22.1\%
+\]
+faster. These times were measured on CPU with one Keras \texttt{predict()} call per image. Each call carries a large fixed overhead, so the absolute numbers overstate true model cost, and the gap between the models would be expected to change under batched GPU inference.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.78\linewidth]{figures/inference_time.png}
+\caption{Mean single-image inference time (CPU).}
+\label{fig:latency}
+\end{figure}
+
+\subsection{Explainability with Grad-CAM}
+Grad-CAM \cite{selvaraju2017gradcam} weights each feature map $A^k$ of the last convolutional layer by the average gradient of the output $y$ with respect to it:
+\begin{equation}
+\alpha_k = \frac{1}{Z}\sum_i \sum_j \frac{\partial y}{\partial A^k_{ij}}, \qquad
+L = \mathrm{ReLU}\Big(\sum_k \alpha_k A^k\Big),
+\end{equation}
+where $Z$ is the number of spatial positions. The map $L$ is then normalised to $[0,1]$ and resized to the input.
+
+Fig.~\ref{fig:gradcam} shows maps for the custom CNN. In correct predictions, much of the activation sits along the borders of the crop rather than on the helmet shell. In the missed bare heads, the activation falls on parts of the face and on background. This suggests the custom CNN partly relies on cues from the padding region and image edges, not only on the head itself.
+
+Grad-CAM for MobileNetV2 failed with a \texttt{KeyError}, which the notebook caught and reported. The code builds the Grad-CAM sub-model from a layer inside the nested backbone, and Keras~3 does not connect that layer to the outer model's graph, so no heat maps were produced for the transfer model.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/gradcam_custom_cnn_correct_prediction.png}\\[2pt]
+\includegraphics[width=\linewidth]{figures/gradcam_custom_cnn_false_negative.png}
+\caption{Grad-CAM for the custom CNN. Top: correct predictions. Bottom: bare heads predicted as helmet (false negatives).}
+\label{fig:gradcam}
+\end{figure}
+
+\subsection{Error analysis}
+Looking at the misclassified test crops in the Grad-CAM rows, the main failure patterns are:
+\begin{itemize}
+  \item dark or low-contrast crops where the outline of the head is hard to see;
+  \item bare heads with dark hair against a dark background, which can resemble a dark helmet;
+  \item heads seen from behind or at a steep angle, where neither a face nor a helmet brim is clearly visible;
+  \item low-resolution crops upsampled to $160\times160$, which blurs the helmet edge.
+\end{itemize}
+
+%==========================================================================
+\section{Discussion and Limitations}
+%==========================================================================
+Even with a two-epoch budget, both models learned the task well. Pretrained ImageNet features give MobileNetV2 a clear lead on every quality metric, while the custom CNN is smaller and faster and is still improving. For a deployment that must catch as many violations as possible, MobileNetV2 is the better choice. Where hardware is very constrained, the custom CNN is a reasonable option, provided it is trained for longer.
+
+Several aspects of the experiment limit how far the exact numbers can be trusted, and they should be fixed in a follow-up run:
+\begin{itemize}
+  \item \textbf{Very short training on CPU.} No GPU was attached, so epochs took 6--26 minutes and only two were possible. The custom CNN's curves had not flattened.
+  \item \textbf{ResNet50 not evaluated.} The run was interrupted during its second epoch, so the comparison covers only two of the three planned models.
+  \item \textbf{Validation/test split.} The validation and test sets come from the same holdout dataset through \texttt{take()} and \texttt{skip()}. Keras reshuffles that dataset each time it is iterated, so the two subsets are not fixed and can overlap. Evidence for this is that the test class counts differ between models (523 against 514 no-helmet crops), even though the test set should be identical. Setting \texttt{shuffle=False} on the holdout, or splitting the files beforehand, would fix this.
+  \item \textbf{Crop-level split.} Crops are split at random rather than by source image, so crops of the same scene, and sometimes the same worker, can appear in both training and test data.
+  \item \textbf{No class weighting or threshold tuning.} All results use a fixed 0.5 threshold and an unweighted loss on 3.69\,:\,1 data. Either change could raise no-helmet recall further.
+  \item \textbf{Grad-CAM for transfer models.} The nested-backbone issue needs fixing before the transfer models can be inspected.
+\end{itemize}
+
+%==========================================================================
+\section{Conclusion and Future Work}
+%==========================================================================
+This project built an end-to-end pipeline for construction helmet use recognition, covering conversion of a detection dataset into cleaned head crops, a custom CNN and two transfer-learning models, evaluation with safety-relevant metrics and latency, and Grad-CAM inspection. MobileNetV2 gave the best results, with 97.34\% accuracy and 0.926 no-helmet recall. The custom CNN reached 94.44\% accuracy and 0.839 recall with about one-ninth of the parameters and 22\% lower latency.
+
+Next steps are to train on a GPU for more epochs, complete the ResNet50 evaluation, fix the validation/test split and split by source image, add class weights and tune the decision threshold on validation data, repair Grad-CAM for the transfer models, and pair the classifier with a head detector for end-to-end monitoring of site video.
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}
